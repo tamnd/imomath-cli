@@ -1,0 +1,10 @@
+title       = "imomath"
+baseURL     = "https://imomath-cli.tamnd.com/"
+description = "Browse imomath.com olympiad resources from the command line"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/imomath-cli"
