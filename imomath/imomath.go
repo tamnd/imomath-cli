@@ -1,62 +1,414 @@
 // Package imomath is the library behind the imomath command line:
-// the HTTP client, request shaping, and the typed data models for imomath.
+// the HTTP client, request shaping, and typed data models for imomath.com.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// imomath.com uses a CGI-based architecture where pages are addressed by
+// ?p=<page> query parameters. The client fetches HTML pages and extracts
+// links, titles, and snippets from the response.
 package imomath
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
-// DefaultUserAgent identifies the client to imomath. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "imomath/dev (+https://github.com/tamnd/imomath-cli)"
+// DefaultUserAgent identifies the client to imomath.com.
+const DefaultUserAgent = "imomath-cli/dev (+https://github.com/tamnd/imomath-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at imomath.com; change it once you
-// know the real endpoints you want to read.
+// Host is the imomath.com hostname.
 const Host = "imomath.com"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://www." + Host
 
-// Client talks to imomath over HTTP.
-type Client struct {
-	HTTP      *http.Client
-	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+// topicPages maps the short topic name to the CGI page parameter.
+var topicPages = map[string]string{
+	"algebra":       "algebra",
+	"geometry":      "geometry",
+	"nt":            "nt",
+	"combinatorics": "combinatorics",
+	"number-theory": "nt",
+	"combo":         "combinatorics",
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// validTopics is the ordered list of standard topic names.
+var validTopics = []string{"algebra", "geometry", "nt", "combinatorics"}
+
+// Config holds constructor parameters for the Client.
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns sensible production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to imomath.com over HTTP.
+type Client struct {
+	cfg        Config
+	httpClient *http.Client
+	last       time.Time
+}
+
+// NewClient returns a Client ready to use.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// pageURL builds the CGI URL for a given page parameter.
+func (c *Client) pageURL(page string) string {
+	if page == "" || page == "index" {
+		return c.cfg.BaseURL + "/index.cgi"
+	}
+	return c.cfg.BaseURL + "/index.cgi?p=" + url.QueryEscape(page)
+}
+
+// urlToID converts an href to a short page ID (the ?p= value).
+func urlToID(href string) string {
+	if !strings.Contains(href, "?") {
+		return ""
+	}
+	u, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	return u.Query().Get("p")
+}
+
+// isProblemLink returns true if the link looks like a problem/resource page.
+func isProblemLink(href string) bool {
+	if href == "" || href == "/" {
+		return false
+	}
+	if strings.HasPrefix(href, "http") && !strings.Contains(href, "imomath") {
+		return false
+	}
+	id := urlToID(href)
+	if id == "" {
+		return false
+	}
+	// Skip the known top-level navigation pages.
+	switch id {
+	case "algebra", "geometry", "nt", "combinatorics", "about", "contact", "index":
+		return false
+	}
+	return true
+}
+
+// resolveURL ensures a relative href becomes an absolute URL.
+func (c *Client) resolveURL(href string) string {
+	if strings.HasPrefix(href, "http") {
+		return href
+	}
+	if strings.HasPrefix(href, "/") {
+		base := c.cfg.BaseURL
+		if i := strings.Index(base[8:], "/"); i >= 0 {
+			base = base[:8+i]
+		}
+		return base + href
+	}
+	return c.cfg.BaseURL + "/" + strings.TrimPrefix(href, "/")
+}
+
+// List returns resources for the given topic (or all topics if topic is "").
+func (c *Client) List(ctx context.Context, topic string, limit int) ([]Resource, error) {
+	var topics []string
+	if topic == "" {
+		topics = validTopics
+	} else {
+		page, ok := topicPages[strings.ToLower(topic)]
+		if !ok {
+			return nil, fmt.Errorf("unknown topic %q; valid topics: %s", topic, strings.Join(validTopics, ", "))
+		}
+		topics = []string{page}
+	}
+
+	var result []Resource
+	seen := map[string]bool{}
+	rank := 0
+	for _, t := range topics {
+		body, err := c.get(ctx, c.pageURL(t))
+		if err != nil {
+			return nil, err
+		}
+		links := c.extractLinks(body, t)
+		for _, r := range links {
+			if seen[r.ID] {
+				continue
+			}
+			seen[r.ID] = true
+			rank++
+			r.Rank = rank
+			result = append(result, r)
+			if limit > 0 && len(result) >= limit {
+				return result, nil
+			}
+		}
+	}
+	return result, nil
+}
+
+// GetProblem fetches a problem/resource page by its page ID.
+func (c *Client) GetProblem(ctx context.Context, id string) (*Problem, error) {
+	pageURL := c.pageURL(id)
+	body, err := c.get(ctx, pageURL)
+	if err != nil {
+		return nil, err
+	}
+
+	title := extractTitle(body)
+	snippet := extractSnippet(body)
+
+	// Determine topic from page content (look for navigation links).
+	topic := guessTopic(id, body)
+
+	return &Problem{
+		ID:      id,
+		Title:   title,
+		Topic:   topic,
+		URL:     pageURL,
+		Snippet: snippet,
+	}, nil
+}
+
+// Search fetches resources across all topics and filters by keyword.
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Resource, error) {
+	all, err := c.List(ctx, "", 0)
+	if err != nil {
+		return nil, err
+	}
+	query = strings.ToLower(query)
+	var result []Resource
+	rank := 0
+	for _, r := range all {
+		if strings.Contains(strings.ToLower(r.Title), query) ||
+			strings.Contains(strings.ToLower(r.ID), query) ||
+			strings.Contains(strings.ToLower(r.Topic), query) {
+			rank++
+			r.Rank = rank
+			result = append(result, r)
+			if limit > 0 && len(result) >= limit {
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+// Info returns aggregate information about the site.
+func (c *Client) Info(ctx context.Context) (Info, error) {
+	body, err := c.get(ctx, c.cfg.BaseURL+"/index.cgi")
+	if err != nil {
+		return Info{}, err
+	}
+	title := extractTitle(body)
+	return Info{
+		Site:    title,
+		Topics:  validTopics,
+		BaseURL: c.cfg.BaseURL,
+	}, nil
+}
+
+// extractLinks parses the HTML body and returns resources linked from a topic page.
+func (c *Client) extractLinks(body []byte, topic string) []Resource {
+	var resources []Resource
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		// Fall back to regex if HTML parsing fails.
+		return c.extractLinksRegex(body, topic)
+	}
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			for _, attr := range n.Attr {
+				if attr.Key == "href" {
+					href := attr.Val
+					if isProblemLink(href) {
+						id := urlToID(href)
+						text := nodeText(n)
+						if text == "" {
+							text = id
+						}
+						resources = append(resources, Resource{
+							ID:    id,
+							Title: text,
+							Topic: topicDisplayName(topic),
+							URL:   c.resolveURL(href),
+							Type:  "problem",
+						})
+					}
+					break
+				}
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+	return resources
+}
+
+// extractLinksRegex is a fallback link extractor using regex.
+func (c *Client) extractLinksRegex(body []byte, topic string) []Resource {
+	hrefRE := regexp.MustCompile(`href="([^"]+)"`)
+	textRE := regexp.MustCompile(`>([^<]+)<`)
+	var resources []Resource
+	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
+		href := string(m[1])
+		if !isProblemLink(href) {
+			continue
+		}
+		id := urlToID(href)
+		title := id
+		if tm := textRE.Find(m[0]); tm != nil {
+			title = strings.TrimSpace(string(tm[1 : len(tm)-1]))
+		}
+		resources = append(resources, Resource{
+			ID:    id,
+			Title: title,
+			Topic: topicDisplayName(topic),
+			URL:   c.resolveURL(href),
+			Type:  "problem",
+		})
+	}
+	return resources
+}
+
+// extractTitle extracts the page title from HTML.
+func extractTitle(body []byte) string {
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		return ""
+	}
+	var title string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "title" {
+			title = nodeText(n)
+			return
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+	return strings.TrimSpace(title)
+}
+
+// extractSnippet extracts a text snippet from the page body.
+func extractSnippet(body []byte) string {
+	doc, err := html.Parse(bytes.NewReader(body))
+	if err != nil {
+		// Fallback: strip tags.
+		tagRE := regexp.MustCompile(`<[^>]+>`)
+		s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
+		if len(s) > 300 {
+			s = s[:300]
+		}
+		return s
+	}
+	// Collect text from <p> elements.
+	var parts []string
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "p" {
+			text := strings.TrimSpace(nodeText(n))
+			if len(text) > 20 {
+				parts = append(parts, text)
+			}
+		}
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+	if len(parts) == 0 {
+		return ""
+	}
+	snippet := strings.Join(parts[:min(3, len(parts))], " ")
+	if len(snippet) > 300 {
+		snippet = snippet[:300]
+	}
+	return snippet
+}
+
+// guessTopic tries to determine the topic of a problem from its ID or body.
+func guessTopic(id string, body []byte) string {
+	id = strings.ToLower(id)
+	for prefix, topic := range map[string]string{
+		"alg": "Algebra",
+		"geo": "Geometry",
+		"nt":  "Number Theory",
+		"com": "Combinatorics",
+	} {
+		if strings.HasPrefix(id, prefix) {
+			return topic
+		}
+	}
+	// Check body for topic links.
+	for _, t := range validTopics {
+		if bytes.Contains(body, []byte(`?p=`+t)) {
+			return topicDisplayName(t)
+		}
+	}
+	return ""
+}
+
+// topicDisplayName returns the human-readable topic name.
+func topicDisplayName(page string) string {
+	switch page {
+	case "algebra":
+		return "Algebra"
+	case "geometry":
+		return "Geometry"
+	case "nt":
+		return "Number Theory"
+	case "combinatorics":
+		return "Combinatorics"
+	default:
+		return page
+	}
+}
+
+// nodeText returns all text content of an HTML node and its descendants.
+func nodeText(n *html.Node) string {
+	if n.Type == html.TextNode {
+		return n.Data
+	}
+	var sb strings.Builder
+	for child := n.FirstChild; child != nil; child = child.NextSibling {
+		sb.WriteString(nodeText(child))
+	}
+	return sb.String()
+}
+
+// get fetches a URL and returns the body bytes with pacing and retry.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +416,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +425,19 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -96,7 +449,6 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, true, err
@@ -104,12 +456,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// pace enforces the inter-request rate limit.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -118,83 +470,14 @@ func (c *Client) pace() {
 func backoff(attempt int) time.Duration {
 	d := time.Duration(attempt) * 500 * time.Millisecond
 	if d > 5*time.Second {
-		d = 5 * time.Second
+		return 5 * time.Second
 	}
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on imomath.com. It is a stand-in for the typed records you
-// will model from the real imomath endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `imomath cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	return b
 }
