@@ -2,6 +2,7 @@ package imomath
 
 import (
 	"context"
+	"fmt"
 	"net/url"
 	"strings"
 
@@ -9,27 +10,18 @@ import (
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes imomath as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go exposes imomath as a kit Domain so a multi-domain host (ant)
+// can enable it with a single blank import:
 //
 //	import _ "github.com/tamnd/imomath-cli/imomath"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// imomath:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone imomath binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The same Domain builds the standalone imomath binary (see cli/root.go).
 func init() { kit.Register(Domain{}) }
 
-// Domain is the imomath driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the imomath driver. It carries no state.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, accepted hostnames, and the binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "imomath",
@@ -37,41 +29,49 @@ func (Domain) Info() kit.DomainInfo {
 		Identity: kit.Identity{
 			Binary: "imomath",
 			Short:  "Browse imomath.com olympiad resources from the command line",
-			Long: `Browse imomath.com olympiad resources from the command line
+			Long: `imomath reads public imomath.com resources over plain HTTPS, shapes them
+into clean records, and prints output that pipes into the rest of your tools.
+No API key, nothing to run alongside it.
 
-imomath reads public imomath data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Commands:
+  list       List resources for a topic (algebra, geometry, nt, combinatorics)
+  problem    Show a specific resource page by ID
+  search     Search across all topics by keyword
+  export     Export all resources for a topic (or all topics)
+  info       Show site information
+
+imomath is an independent tool and is not affiliated with imomath.com.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/imomath-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `imomath page` and
-	// `ant get imomath://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "list", Group: "read", List: true,
+		Summary: "List resources for a topic"}, listResources)
 
-	// List op: members of a page, the home of `imomath links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// imomath://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "problem", Group: "read", Single: true,
+		Summary: "Show a resource page by ID",
+		Args:    []kit.Arg{{Name: "id", Help: "page ID (the ?p= parameter value)"}}}, getProblem)
+
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search for resources by keyword",
+		Args:    []kit.Arg{{Name: "query", Help: "search keyword"}}}, searchResources)
+
+	kit.Handle(app, kit.OpMeta{Name: "export", Group: "read", List: true,
+		Summary: "Export all resources for a topic (or all topics)"}, exportResources)
+
+	kit.Handle(app, kit.OpMeta{Name: "info", Group: "read", Single: true,
+		Summary: "Show site information"}, getInfo)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from the kit config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,92 +82,133 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- list ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type listResourcesIn struct {
+	Topic  string  `kit:"flag"        help:"filter by topic (algebra, geometry, nt, combinatorics)"`
+	Limit  int     `kit:"flag,inherit" help:"max results (0 = no limit)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
-
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func listResources(ctx context.Context, in listResourcesIn, emit func(*Resource) error) error {
+	items, err := in.Client.List(ctx, in.Topic, in.Limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// --- problem ---
 
-// Classify turns any accepted input — a bare path or a full imomath.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized imomath reference: %q", input)
-	}
-	return "page", id, nil
+type getProblemIn struct {
+	ID     string  `kit:"arg"    help:"page ID (the ?p= parameter value)"`
+	Client *Client `kit:"inject"`
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func getProblem(ctx context.Context, in getProblemIn, emit func(*Problem) error) error {
+	if in.ID == "" {
+		return errs.Usage("id is required")
+	}
+	p, err := in.Client.GetProblem(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(p)
+}
+
+// --- search ---
+
+type searchResourcesIn struct {
+	Query  string  `kit:"arg"         help:"search keyword"`
+	Limit  int     `kit:"flag,inherit" help:"max results (0 = no limit)"`
+	Client *Client `kit:"inject"`
+}
+
+func searchResources(ctx context.Context, in searchResourcesIn, emit func(*Resource) error) error {
+	if in.Query == "" {
+		return errs.Usage("query is required")
+	}
+	items, err := in.Client.Search(ctx, in.Query, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- export ---
+
+type exportResourcesIn struct {
+	Topic  string  `kit:"flag"   help:"export resources for a specific topic (empty = all)"`
+	Client *Client `kit:"inject"`
+}
+
+func exportResources(ctx context.Context, in exportResourcesIn, emit func(*Resource) error) error {
+	items, err := in.Client.List(ctx, in.Topic, 0)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range items {
+		if err := emit(&items[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- info ---
+
+type getInfoIn struct {
+	Client *Client `kit:"inject"`
+}
+
+func getInfo(ctx context.Context, in getInfoIn, emit func(*Info) error) error {
+	info, err := in.Client.Info(ctx)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(&info)
+}
+
+// Classify turns a URL or page ID into (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if u, err2 := url.Parse(input); err2 == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		if p := u.Query().Get("p"); p != "" {
+			return "problem", p, nil
+		}
+	}
+	if input != "" {
+		return "problem", input, nil
+	}
+	return "", "", errs.Usage("cannot classify %q: use a page ID or imomath.com URL", input)
+}
+
+// Locate is the inverse of Classify.
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "problem":
+		return fmt.Sprintf("https://www.%s/index.cgi?p=%s", Host, url.QueryEscape(id)), nil
+	default:
 		return "", errs.Usage("imomath has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts errors to kit error kinds.
 func mapErr(err error) error {
 	return err
 }
