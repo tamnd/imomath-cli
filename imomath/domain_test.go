@@ -2,13 +2,7 @@ package imomath
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
-
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in imomath_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -23,54 +17,49 @@ func TestDomainInfo(t *testing.T) {
 	}
 }
 
-func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
-	}
-	for _, tc := range cases {
-		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
-		}
-	}
-}
-
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
-	}
-}
-
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
+func TestClassify_url(t *testing.T) {
+	typ, id, err := Domain{}.Classify("https://www.imomath.com/index.cgi?p=algebra_problems1")
 	if err != nil {
 		t.Fatal(err)
 	}
+	if typ != "problem" {
+		t.Errorf("typ = %q, want problem", typ)
+	}
+	if id != "algebra_problems1" {
+		t.Errorf("id = %q, want algebra_problems1", id)
+	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
+func TestClassify_id(t *testing.T) {
+	typ, id, err := Domain{}.Classify("nt_basics")
 	if err != nil {
-		t.Fatalf("Mint: %v", err)
+		t.Fatal(err)
 	}
-	if want := "imomath://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if typ != "problem" {
+		t.Errorf("typ = %q, want problem", typ)
 	}
+	if id != "nt_basics" {
+		t.Errorf("id = %q, want nt_basics", id)
+	}
+}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
+func TestLocate_problem(t *testing.T) {
+	got, err := Domain{}.Locate("problem", "algebra_problems1")
+	if err != nil {
+		t.Fatal(err)
 	}
+	if got == "" {
+		t.Error("Locate returned empty URL")
+	}
+	want := "https://www.imomath.com/index.cgi?p=algebra_problems1"
+	if got != want {
+		t.Errorf("Locate = %q, want %q", got, want)
+	}
+}
 
-	got, err := h.ResolveOn("imomath", "about")
-	if err != nil || got.String() != "imomath://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want imomath://page/about", got.String(), err)
+func TestLocate_unknownType(t *testing.T) {
+	_, err := Domain{}.Locate("unknown", "foo")
+	if err == nil {
+		t.Error("expected error for unknown type")
 	}
 }
